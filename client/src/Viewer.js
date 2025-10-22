@@ -1,3 +1,4 @@
+// Viewer.js
 import React, { useState, useEffect, useRef } from 'react';
 import io from 'socket.io-client';
 import './Viewer.css';
@@ -8,6 +9,8 @@ const socket = io('http://localhost:5000');
 function Viewer({ onReset }) {
   // State management
   const [roomId, setRoomId] = useState('');
+  const [viewerName, setViewerName] = useState('');
+  const [roomPassword, setRoomPassword] = useState('');
   const [isJoined, setIsJoined] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState('');
@@ -27,15 +30,16 @@ function Viewer({ onReset }) {
     ]
   };
 
-  // Join room function
+  // Join room function (sends name and password)
   const joinRoom = () => {
     if (!roomId.trim()) {
       setError('Please enter a room code');
       return;
     }
-
-    // Emit join-room event to server
-    socket.emit('join-room', roomId.toUpperCase());
+    // default name
+    const nameToSend = viewerName.trim() || 'Viewer';
+    setError('');
+    socket.emit('join-room', { roomId: roomId.toUpperCase(), name: nameToSend, password: roomPassword });
   };
 
   // Create peer connection
@@ -45,28 +49,24 @@ function Viewer({ onReset }) {
     // Handle incoming stream tracks
     peerConnection.ontrack = (event) => {
       console.log('Received remote track');
-      
-      // Get the remote stream
+
       const stream = event.streams[0];
       remoteStreamRef.current = stream;
 
-      // Display in video element
       if (remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = stream;
       }
 
       setIsConnected(true);
-
-      // Start recording automatically
       startRecording(stream);
     };
 
     // Handle ICE candidates
     peerConnection.onicecandidate = (event) => {
-      if (event.candidate) {
+      if (event.candidate && socket.hostId) {
         socket.emit('ice-candidate', {
           candidate: event.candidate,
-          to: socket.hostId // Will be set when we receive offer
+          to: socket.hostId // host
         });
       }
     };
@@ -74,8 +74,8 @@ function Viewer({ onReset }) {
     // Handle connection state changes
     peerConnection.onconnectionstatechange = () => {
       console.log('Connection state:', peerConnection.connectionState);
-      
-      if (peerConnection.connectionState === 'disconnected' || 
+
+      if (peerConnection.connectionState === 'disconnected' ||
           peerConnection.connectionState === 'failed') {
         setIsConnected(false);
         stopRecording();
@@ -90,10 +90,9 @@ function Viewer({ onReset }) {
   // Start recording the remote stream
   const startRecording = (stream) => {
     try {
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'video/webm;codecs=vp8,opus'
-      });
-
+      // viewer default format
+      const options = { mimeType: 'video/webm;codecs=vp8,opus' };
+      const mediaRecorder = new MediaRecorder(stream, options);
       const chunks = [];
 
       mediaRecorder.ondataavailable = (event) => {
@@ -105,14 +104,12 @@ function Viewer({ onReset }) {
       mediaRecorder.onstop = () => {
         const blob = new Blob(chunks, { type: 'video/webm' });
         const url = URL.createObjectURL(blob);
-        
-        // Create download link
+
         const a = document.createElement('a');
         a.href = url;
         a.download = `recorded-stream-${roomId}-${Date.now()}.webm`;
         a.click();
-        
-        // Clean up
+
         URL.revokeObjectURL(url);
       };
 
@@ -120,18 +117,19 @@ function Viewer({ onReset }) {
       mediaRecorderRef.current = mediaRecorder;
       setIsRecording(true);
 
-      console.log('Recording started');
+      console.log('Viewer recording started');
+
     } catch (error) {
-      console.error('Error starting recording:', error);
+      console.error('Error starting viewer recording:', error);
     }
   };
 
   // Stop recording
   const stopRecording = () => {
     if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
+      try { mediaRecorderRef.current.stop(); } catch (e) {}
       setIsRecording(false);
-      console.log('Recording stopped');
+      console.log('Viewer recording stopped');
     }
   };
 
@@ -140,7 +138,7 @@ function Viewer({ onReset }) {
     stopRecording();
 
     if (peerConnectionRef.current) {
-      peerConnectionRef.current.close();
+      try { peerConnectionRef.current.close(); } catch (e) {}
       peerConnectionRef.current = null;
     }
 
@@ -148,74 +146,77 @@ function Viewer({ onReset }) {
       remoteVideoRef.current.srcObject = null;
     }
 
-    // socket.emit('disconnect');
-
     setIsJoined(false);
     setIsConnected(false);
     setRoomId('');
+    setViewerName('');
+    setRoomPassword('');
     setError('');
   };
 
   // Setup socket event listeners
   useEffect(() => {
-    // When successfully joined room
     socket.on('room-joined', (data) => {
       console.log('Joined room:', data.roomId);
       setIsJoined(true);
       setError('');
     });
 
-    // When there's an error joining
     socket.on('error', (data) => {
       console.error('Error:', data.message);
       setError(data.message);
+      alert(data.message);
     });
 
-    // When receiving offer from host
+    // Receiving offer from host
     socket.on('offer', async (data) => {
       console.log('Received offer from host');
-      
-      // Store host ID for later use
+
+      // store host id
       socket.hostId = data.from;
 
-      // Create peer connection
+      // create pc
       const peerConnection = createPeerConnection();
 
-      // Set remote description (the offer)
-      await peerConnection.setRemoteDescription(
-        new RTCSessionDescription(data.offer)
-      );
-
-      // Create answer
-      const answer = await peerConnection.createAnswer();
-      await peerConnection.setLocalDescription(answer);
-
-      // Send answer back to host
-      socket.emit('answer', {
-        answer: answer,
-        to: data.from
-      });
-    });
-
-    // When receiving ICE candidate from host
-    socket.on('ice-candidate', async (data) => {
-      console.log('Received ICE candidate from host');
-      
-      if (peerConnectionRef.current && data.candidate) {
-        await peerConnectionRef.current.addIceCandidate(
-          new RTCIceCandidate(data.candidate)
+      try {
+        await peerConnection.setRemoteDescription(
+          new RTCSessionDescription(data.offer)
         );
+
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+
+        socket.emit('answer', {
+          answer: answer,
+          to: data.from
+        });
+
+      } catch (err) {
+        console.error('Error handling offer:', err);
+        setError('Failed to process host offer');
       }
     });
 
-    // When host disconnects
+    socket.on('ice-candidate', async (data) => {
+      console.log('Received ICE candidate from host');
+
+      if (peerConnectionRef.current && data.candidate) {
+        try {
+          await peerConnectionRef.current.addIceCandidate(
+            new RTCIceCandidate(data.candidate)
+          );
+        } catch (err) {
+          console.error('Error adding ICE candidate:', err);
+        }
+      }
+    });
+
     socket.on('host-disconnected', () => {
       console.log('Host disconnected');
       alert('The host has ended the stream');
       leaveRoom();
     });
 
-    // Cleanup on unmount
     return () => {
       socket.off('room-joined');
       socket.off('error');
@@ -225,16 +226,27 @@ function Viewer({ onReset }) {
     };
   }, []);
 
+  // Picture-in-picture for viewer
+  const openPictureInPicture = async () => {
+    try {
+      if (remoteVideoRef.current) {
+        await remoteVideoRef.current.requestPictureInPicture();
+      }
+    } catch (err) {
+      console.error('Viewer PiP error:', err);
+      alert('Picture-in-Picture not available: ' + (err.message || err));
+    }
+  };
+
   return (
     <div className="viewer-container">
       <h2>Watch Live Stream</h2>
 
       {!isJoined ? (
-        // Show join interface
         <div className="join-section">
           <p>Enter the room code to join a live stream</p>
           
-          <div className="input-group">
+          <div style={{ marginBottom: 10 }}>
             <input
               type="text"
               placeholder="Enter Room Code"
@@ -244,19 +256,40 @@ function Viewer({ onReset }) {
               maxLength={6}
               className="room-input"
             />
+          </div>
+
+          <div style={{ marginBottom: 10 }}>
+            <input
+              type="text"
+              placeholder="Your Name (optional)"
+              value={viewerName}
+              onChange={(e) => setViewerName(e.target.value)}
+              className="room-input"
+            />
+          </div>
+
+          <div style={{ marginBottom: 10 }}>
+            <input
+              type="password"
+              placeholder="Room Password (if required)"
+              value={roomPassword}
+              onChange={(e) => setRoomPassword(e.target.value)}
+              className="room-input"
+            />
+          </div>
+
+          <div className="input-group" style={{ gap: 8 }}>
             <button className="join-button" onClick={joinRoom}>
               Join Stream
+            </button>
+            <button className="back-button" onClick={onReset}>
+              Back to Home
             </button>
           </div>
 
           {error && <p className="error-message">{error}</p>}
-
-          <button className="back-button" onClick={onReset}>
-            Back to Home
-          </button>
         </div>
       ) : (
-        // Show viewing interface
         <div className="viewing-section">
           <div className="status-bar">
             <div className="status-info">
@@ -289,15 +322,15 @@ function Viewer({ onReset }) {
             )}
           </div>
 
-          <div className="controls">
+          <div style={{ display: 'flex', gap: 12, justifyContent: 'center', marginTop: 12 }}>
             <button className="leave-button" onClick={leaveRoom}>
               Leave Stream
             </button>
-            <button className="back-button" onClick={() => {
-              leaveRoom();
-              onReset();
-            }}>
+            <button className="back-button" onClick={() => { leaveRoom(); onReset(); }}>
               Leave & Go Home
+            </button>
+            <button className="back-button" onClick={openPictureInPicture}>
+              PiP
             </button>
           </div>
         </div>
